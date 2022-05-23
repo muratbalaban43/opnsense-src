@@ -51,6 +51,7 @@
 #include <machine/resource.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
+#include <sys/systm.h>
 #include <net/ethernet.h>
 #include <dev/netmap/netmap_kern.h>
 
@@ -95,22 +96,48 @@ error:
 	return;
 }
 
-static int
-netmap_tuncapture(struct ifnet *ifp, int isr, struct mbuf *m)
+static struct mbuf *
+netmap_prepend_eth_hdr(struct ifnet *ifp, struct mbuf *m, int isr, int adj)
 {
 	struct netmap_adapter *na = NA(ifp);
 	struct ether_header *eh;
 
 	if (!nm_netmap_on(na))
+		return m;
+
+	if (adj)
+		m_adj(m, adj);
+
+	M_PREPEND(m, ETHER_HDR_LEN, M_NOWAIT);
+	if (m == NULL)
+		return NULL;
+
+	eh = mtod(m, struct ether_header *);
+	eh->ether_type = htons(isr == NETISR_IPV6 ? ETHERTYPE_IPV6 : ETHERTYPE_IP);
+	memcpy(eh->ether_shost, "\x02\x02\x02\x02\x02\x02", ETHER_ADDR_LEN);
+	memcpy(eh->ether_dhost, "\x06\x06\x06\x06\x06\x06", ETHER_ADDR_LEN);
+
+	return m;
+}
+
+static int
+netmap_tuncapture(struct ifnet *ifp, int isr, struct mbuf *m)
+{
+	struct netmap_adapter *na = NA(ifp);
+	struct ether_header *eh;
+	int prev_len;
+
+	if (!nm_netmap_on(na))
 		return 0;
 
+	prev_len = m->m_len;
 	M_PREPEND(m, ETHER_HDR_LEN, M_NOWAIT);
 	if (m == NULL) {
 		nm_prlim(5, "failed to prepend fake ethernet header, skipping");
 		return 0;
 	}
 	eh = mtod(m, struct ether_header *);
-	eh->ether_type = htons(isr == AF_INET6 ? ETHERTYPE_IPV6 : ETHERTYPE_IP);
+	eh->ether_type = htons(isr == NETISR_IPV6 ? ETHERTYPE_IPV6 : ETHERTYPE_IP);
 	memcpy(eh->ether_shost, "\x02\x02\x02\x02\x02\x02", ETHER_ADDR_LEN);
 	memcpy(eh->ether_dhost, "\x06\x06\x06\x06\x06\x06", ETHER_ADDR_LEN);
 	(*ifp->if_input)(ifp, m);

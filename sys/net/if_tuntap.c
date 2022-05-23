@@ -1378,8 +1378,8 @@ tunoutput(struct ifnet *ifp, struct mbuf *m0, const struct sockaddr *dst,
 {
 	struct tuntap_softc *tp = ifp->if_softc;
 	u_short cached_tun_flags;
-	int error;
-	u_int32_t af;
+	int error, adj = 0;
+	u_int32_t af, isr;
 
 	TUNDEBUG (ifp, "tunoutput\n");
 
@@ -1419,6 +1419,7 @@ tunoutput(struct ifnet *ifp, struct mbuf *m0, const struct sockaddr *dst,
 	if (cached_tun_flags & TUN_LMODE) {
 		/* allocate space for sockaddr */
 		M_PREPEND(m0, dst->sa_len, M_NOWAIT);
+		adj = dst->sa_len;
 
 		/* if allocation failed drop packet */
 		if (m0 == NULL) {
@@ -1433,6 +1434,7 @@ tunoutput(struct ifnet *ifp, struct mbuf *m0, const struct sockaddr *dst,
 	if (cached_tun_flags & TUN_IFHEAD) {
 		/* Prepend the address family */
 		M_PREPEND(m0, 4, M_NOWAIT);
+		adj = 4;
 
 		/* if allocation failed drop packet */
 		if (m0 == NULL) {
@@ -1451,6 +1453,22 @@ tunoutput(struct ifnet *ifp, struct mbuf *m0, const struct sockaddr *dst,
 		}
 	}
 
+#if DEV_NETMAP
+	switch (af) {
+	case AF_INET:
+		isr = NETISR_IP;
+		break;
+	case AF_INET6:
+		isr = NETISR_IP;
+		break;
+	default:
+		m_freem(m0);
+		return (EAFNOSUPPORT);
+	}
+	m0 = netmap_prepend_eth_hdr(ifp, m0, isr, adj);
+	if (!m0)
+		return (ENOBUFS);
+#endif
 	error = (ifp->if_transmit)(ifp, m0);
 	if (error)
 		return (ENOBUFS);
@@ -1672,6 +1690,42 @@ tunioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
 	return (0);
 }
 
+static int
+restore_tunhdr(struct ifnet *ifp, struct mbuf **m0)
+{
+	struct netmap_adapter *na = NA(ifp);
+	struct mbuf *m;
+	struct ether_header *eh;
+	u_int32_t *afp, af;
+
+	if (!nm_netmap_on(na))
+		return 0;
+
+	m = *m0;
+
+	if (m->m_len < ETHER_HDR_LEN &&
+	    (m = m_pullup(m, ETHER_HDR_LEN)) == NULL)
+		return (ENOBUFS);
+
+	eh = mtod(m, struct ether_header *);
+	switch (eh->ether_type) {
+	case ntohs(ETHERTYPE_IP):
+		af = AF_INET;
+		break;
+	case ntohs(ETHERTYPE_IPV6):
+		af = AF_INET6;
+		break;
+	default:
+		return (EAFNOSUPPORT);
+	}
+	m_adj(m, ETHER_HDR_LEN - 4);
+	afp = mtod(m, u_int32_t *);
+	*afp = htonl(af);
+	*m0 = m;
+
+	return 0;
+}
+
 /*
  * The cdevsw read interface - reads a packet at a time, or at
  * least as much of a packet as can be read.
@@ -1732,6 +1786,14 @@ tunread(struct cdev *dev, struct uio *uio, int flag)
 		    vhdr.hdr.csum_offset);
 		error = uiomove(&vhdr, len, uio);
 	}
+
+#ifdef DEV_NETMAP
+	error = restore_tunhdr(ifp, &m);
+	if (error) {
+		m_free(m);
+		return error;
+	}
+#endif /* DEV_NETMAP */
 
 	while (m && uio->uio_resid > 0 && error == 0) {
 		len = min(uio->uio_resid, m->m_len);
